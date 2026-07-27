@@ -40,6 +40,12 @@ pw_m32101234: dw -3, -2, -1, 0, 1, 2, 3, 4
 pw_m3:        times 8 dw -3
 pd_17:        times 4 dd 17
 
+; plane prediction: H gradient coefficients for top[-1..6] and top[8..15],
+; and the per-column ramp 0..15 (dwords, for the 32-bit accumulators)
+plane_coef_lo: dw -8, -7, -6, -5, -4, -3, -2, -1
+plane_coef_hi: dw  1,  2,  3,  4,  5,  6,  7,  8
+plane_ramp:    dd  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15
+
 SECTION .text
 
 ; dest, left, right, src
@@ -1299,6 +1305,97 @@ cglobal pred16x16_128_dc_10, 2, 4
     movu  [r0+r3  ], m0
     lea        r0, [r0+r1*4]
     dec       r2d
+    jg .loop
+    RET
+
+;-----------------------------------------------------------------------------
+; void ff_pred16x16_plane_10_avx2(pixel *src, ptrdiff_t stride)
+; H.264 intra 16x16 plane prediction, 10-bit.
+;   H, V = weighted gradients of the top row / left column
+;   pred[x,y] = clip((a + y*V + x*H) >> 5, 0, 1023)
+; Values exceed 16-bit range at 10-bit, so the 16 columns live in two YMM
+; registers of 32-bit accumulators.
+;-----------------------------------------------------------------------------
+INIT_YMM avx2
+cglobal pred16x16_plane_10, 2, 9, 8
+    ; ---- H: gradient over the top row (row -1) ----
+    mov          r2, r0
+    sub          r2, r1                ; r2 = &top[0]
+    movu        xm0, [r2-2]            ; top[-1..6]  (8 words)
+    movu        xm1, [r2+16]           ; top[8..15]  (8 words)
+    pmaddwd     xm0, [plane_coef_lo]
+    pmaddwd     xm1, [plane_coef_hi]
+    paddd       xm0, xm1               ; 4 dword partial sums
+    pshufd      xm1, xm0, 0x0e
+    paddd       xm0, xm1
+    pshufd      xm1, xm0, 0x01
+    paddd       xm0, xm1               ; H (raw) in the low dword
+    movd        r3d, xm0
+    lea         r3d, [r3d*5+32]
+    sar         r3d, 6                 ; r3d = H = (5*H+32)>>6
+    movzx       r8d, word [r2+30]      ; top[15], kept for a
+
+    ; ---- V: gradient over the left column (scalar; it is strided) ----
+    lea          r4, [r0+r1*8]
+    sub          r4, 2                 ; &left[8]
+    lea          r5, [r0+r1*4]
+    lea          r5, [r5+r1*2]
+    sub          r5, 2                 ; &left[6]
+    movzx       r6d, word [r4]
+    movzx       r7d, word [r5]
+    sub         r6d, r7d
+    mov         r2d, r6d               ; V acc, k=1 term
+%assign k 2
+%rep 7
+    add          r4, r1
+    sub          r5, r1
+    movzx       r6d, word [r4]
+    movzx       r7d, word [r5]
+    sub         r6d, r7d
+    imul        r6d, r6d, k
+    add         r2d, r6d
+%assign k k+1
+%endrep
+    lea         r2d, [r2d*5+32]
+    sar         r2d, 6                 ; r2d = V = (5*V+32)>>6
+
+    ; ---- a = 16*(left[15] + top[15] + 1) - 7*(H+V) ----
+    movzx       r6d, word [r4]         ; r4 == &left[15] after the loop
+    lea         r6d, [r6+r8+1]
+    shl         r6d, 4                 ; 16*(left15 + top15 + 1)
+    mov         r7d, r2d
+    add         r7d, r3d               ; H+V
+    mov         r8d, r7d
+    shl         r8d, 3
+    sub         r8d, r7d               ; 7*(H+V)
+    sub         r6d, r8d               ; r6d = a
+
+    ; ---- build the column ramps: acc = a + col*H (dwords) ----
+    movd        xm3, r3d
+    vpbroadcastd m3, xm3               ; H
+    movd        xm2, r6d
+    vpbroadcastd m2, xm2               ; a
+    movd        xm4, r2d
+    vpbroadcastd m4, xm4               ; V
+    pmulld       m0, m3, [plane_ramp]
+    pmulld       m1, m3, [plane_ramp+32]
+    paddd        m0, m2                ; a + {0..7}*H
+    paddd        m1, m2                ; a + {8..15}*H
+    vpbroadcastw m7, [pw_pixel_max]    ; 1023, for the high clamp
+
+    ; ---- fill 16 rows ----
+    mov         r2d, 16
+.loop:
+    vpsrad       m5, m0, 5
+    vpsrad       m6, m1, 5
+    vpackusdw    m5, m5, m6            ; dword->word, clamps low to 0; lanes scrambled
+    vpermq       m5, m5, 0xd8          ; unscramble to columns 0..15
+    vpminuw      m5, m5, m7            ; clamp high to 1023
+    movu       [r0], m5
+    paddd        m0, m4                ; next row: += V
+    paddd        m1, m4
+    add          r0, r1
+    dec         r2d
     jg .loop
     RET
 

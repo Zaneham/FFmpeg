@@ -103,6 +103,7 @@ PRED16x16(128_dc, 10, avx2)
 PRED16x16(left_dc, 10, avx2)
 PRED16x16(vertical, 10, avx2)
 PRED16x16(horizontal, 10, avx2)
+PRED16x16(plane, 10, avx2)
 
 /* 8-bit versions */
 PRED16x16(vertical, 8, sse)
@@ -321,6 +322,7 @@ av_cold void ff_h264_pred_init_x86(H264PredContext *h, int codec_id,
             h->pred16x16[LEFT_DC_PRED8x8   ] = ff_pred16x16_left_dc_10_avx2;
             h->pred16x16[VERT_PRED8x8      ] = ff_pred16x16_vertical_10_avx2;
             h->pred16x16[HOR_PRED8x8       ] = ff_pred16x16_horizontal_10_avx2;
+            h->pred16x16[PLANE_PRED8x8     ] = ff_pred16x16_plane_10_avx2;
         }
     }
 }
